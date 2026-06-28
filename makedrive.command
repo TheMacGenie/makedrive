@@ -2251,6 +2251,59 @@ preflight_check_root () {
 }
 
 # ------------------------------------------------------------------------------
+# migrate_conf_file
+# Relocates makedrive.conf from the script directory to Application Support,
+# archiving any existing conf file with a timestamp. Keeps the 10 most recent
+# archived configurations in a "conf archive" subdirectory.
+#
+# $1 - Source conf path
+# $2 - Target conf path
+# $3 - Support directory where archive folder will be created
+# ------------------------------------------------------------------------------
+migrate_conf_file () {
+
+	local sourceConf="$1"
+	local targetConf="$2"
+	local supportDir="$3"
+	local archiveDir="${supportDir}/conf archive"
+	local timestamp archivedFile archiveCount archivesToDelete i
+
+	mkdir -p "$supportDir"
+	mkdir -p "$archiveDir"
+
+	if [ -f "$targetConf" ]; then
+		timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+		archivedFile="${archiveDir}/makedrive.conf_archived_${timestamp}"
+
+		if ! cp "$targetConf" "$archivedFile"; then
+			echo "Warning: Could not archive existing conf file to $archivedFile"
+			return 1
+		fi
+	fi
+
+	if ! mv "$sourceConf" "$targetConf"; then
+		echo "Warning: Could not move conf file to $targetConf"
+		return 1
+	fi
+
+	# Clean up old archives, keeping only the 10 most recent
+	# Count existing archives by sorting files and removing excess ones
+	archiveCount=$(find "$archiveDir" -name "makedrive.conf_archived_*" -type f 2>/dev/null | wc -l)
+
+	if [ "$archiveCount" -gt 10 ]; then
+		archivesToDelete=$(( archiveCount - 10 ))
+		find "$archiveDir" -name "makedrive.conf_archived_*" -type f 2>/dev/null \
+			| sort | head -n "$archivesToDelete" | while IFS= read -r oldArchive; do
+			rm -f "$oldArchive"
+		done
+	fi
+
+	return 0
+
+}
+
+
+# ------------------------------------------------------------------------------
 # preflight_check_xcode_cli_tools
 # makedrive depends on two tools from the Xcode Command Line Tools: setfile
 # (assigns custom volume icons to DMGs) and python3 (fetches macOS version data
@@ -2559,10 +2612,9 @@ preflight_check_xcode_cli_tools
 # Migrate makedrive.conf to Application Support now that root is established.
 # A conf alongside the script replaces the one in Application Support, making
 # this the natural update path: ship a new conf with a new script release and
-# the first root run installs it.
+# the first root run installs it. Old confs are archived with timestamps.
 if [ -f "$executionPath/makedrive.conf" ]; then
-	mkdir -p "$makedriveSupportDir"
-	mv "$executionPath/makedrive.conf" "$makedriveSupportConf"
+	migrate_conf_file "$executionPath/makedrive.conf" "$makedriveSupportConf" "$makedriveSupportDir"
 fi
 
 startup_sync_versions
