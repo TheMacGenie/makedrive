@@ -8,10 +8,10 @@
 # Ian Williams, The Mac Genie LLC
 # ian@themacgenie.com
 #
-# https://github.com/TheMacGenie/makedrive
+# https://makedrive.com
 #
 # Current script version:
-currentVersion="2026-06-27 - Build 201"
+currentVersion="2026-06-28 - Build 201"
 
 # Global Variable Declarations
 bootDiskID=""
@@ -139,8 +139,7 @@ add_copy_single_dmg () {
 		disp_print_header
 		echo "The disk image could not be mounted. Verify the file and try again."
 		echo ""
-		echo "Hit enter to continue."
-		read -r _
+		disp_pause_for_input
 		imagePathToAdd=""
 		return 1
 	fi
@@ -258,9 +257,8 @@ add_copy_single_dmg () {
 	fi
 	
 	echo ""
-	echo "Hit enter to continue... "
-	read -r _
-	
+	disp_pause_for_input
+
 	imagePathToAdd=""
 
 }
@@ -322,7 +320,7 @@ verify_installer_build () {
 	# New-format (11+): build string is inside SharedSupport.dmg at a known path.
 	[ -f "$ssDmg" ] || return 1
 
-	local ssAttach ssDevice ssMountPoint
+	local ssAttach ssMountPoint
 	ssAttach=$(hdiutil attach -noverify -nobrowse -readonly "$ssDmg" 2>/dev/null)
 	ssDevice=$(echo "$ssAttach"    | awk 'NR==1{print $1}')
 	ssMountPoint=$(echo "$ssAttach" | awk -F'\t' 'NF>=3{mp=$NF} END{print mp}')
@@ -352,18 +350,16 @@ add_mas_build_mismatch () {
 	echo "The installer in /Applications does not match the expected macOS build for"
 	echo "the version chosen. Verify the installer and try again."
 	echo ""
-	echo "Hit enter to continue."
-	echo ""
 
 }
 
 
 # ------------------------------------------------------------------------------
-# add_mas_createinstallmedia
-# Processes a newer Mac App Store system installer into an install DMG that can
-# be restored to disk. Required on 10.14 Mojave and later because createinstallmedia
-# blesses the DMG root rather than a full OS volume, and must download assets
-# during creation.
+# add_mas_createinstallmedia_impl
+# Shared implementation for both createinstallmedia wrapper functions below.
+# $7 = "yos" selects the --applicationpath path with codesign workarounds
+# (El Capitan through High Sierra); any other value uses --downloadassets
+# (Mojave and later).
 #
 # $1 - Path to MAS install application given by user
 # $2 - macOS build string to verify (e.g. "24G85"); empty string skips check
@@ -371,150 +367,42 @@ add_mas_build_mismatch () {
 # $4 - Final name of installation DMG volume
 # $5 - Path to final destination of install DMG within restorekit
 # $6 - Display name of MAS install application
+# $7 - "yos" for --applicationpath style; omit or empty for --downloadassets
 # ------------------------------------------------------------------------------
-add_mas_createinstallmedia () {
+add_mas_createinstallmedia_impl () {
 
 	disp_print_header
 
-	# Verify the installer app contains the expected macOS build string.
-	# verify_installer_build checks InstallInfo.plist for 10.11–10.15 and mounts
-	# SharedSupport.dmg briefly for 11+. An empty build string always passes.
-	if verify_installer_build "$1" "$2"; then
-
-		disp_print_header
-
-		echo "Creating $6 installation master DMG file..."
-		echo ""
-
-		# Temp volume name is always FinalName + " temp"; the name createinstallmedia
-		# sets on the volume is always the app bundle name without the .app extension.
-		local newImageVolName="${4} temp"
-		local endName="${1##*/}"; endName="${endName%.app}"
-
-		if ! add_create_install_dmg "$makedriveInstTmpImageFile" "$3" "$newImageVolName"; then
-			echo ""
-			echo "Could not create the temporary installer DMG. Check available disk space."
-			rm -f "$makedriveInstTmpImageFile"
-			echo ""
-			echo "Hit enter to continue."
-			read -r _
-			return 1
-		fi
-
-		echo ""
-		echo "Creating $6 bootable DMG..."
-		echo ""
-
-		if ! "$1/Contents/Resources/createinstallmedia" --volume "/Volumes/$newImageVolName" --nointeraction --downloadassets; then
-			echo ""
-			echo "createinstallmedia failed. Check the installer and available disk space,"
-			echo "then try again."
-			hdiutil detach -force "/Volumes/$newImageVolName" 2>/dev/null
-			hdiutil detach -force "/Volumes/$endName" 2>/dev/null
-			hdiutil detach -force "/Volumes/Shared Support" 2>/dev/null
-			rm -f "$makedriveInstTmpImageFile"
-			echo ""
-			echo "Hit enter to continue."
-			read -r _
-			return 1
-		fi
-
-		dmg_apply_volume_icon "$1" "/Volumes/$endName"
-
-		diskutil rename "/Volumes/$endName" "$4"
-
-		local appPathForReceiptWipe="${1#/Applications/}"
-
-		rm -rf "/Volumes/$4/$appPathForReceiptWipe/Contents/_MASReceipt/"
-
-		touch "/Volumes/$4/.metadata_never_index"
-
-		sleep 3
-
-		# checking workaround for new (2025 era) behavior for macOS Big Sur installer
-		# not properly unmounting causing creation process to fail compress and scan
-		# and using force after waiting for disk activity to wind down
-
-		hdiutil detach -force "/Volumes/$4"
-
-		sleep 1
-
-		if ! mv "$makedriveInstTmpImageFile" "$5"; then
-			echo ""
-			echo "Could not move the completed DMG to restorekit. Check permissions and disk space."
-			hdiutil detach -force "/Volumes/Shared Support" 2>/dev/null
-			echo ""
-			echo "Hit enter to continue."
-			read -r _
-			return 1
-		fi
-
-		# Detach the Shared Support volume left mounted by createinstallmedia.
-		hdiutil detach -force "/Volumes/Shared Support"
-
-		dmgtool_compress_dmg "$5"
-		dmgtool_scan_dmg "$5"
-
-		echo ""
-		echo "$6 is ready for use. Hit enter to continue."
-		echo ""
-
-	else
-
+	if ! verify_installer_build "$1" "$2"; then
 		add_mas_build_mismatch
-
+		disp_pause_for_input
+		return 1
 	fi
 
-	read -r _
-
-}
-
-
-# ------------------------------------------------------------------------------
-# add_mas_createinstallmedia_yos
-# Processes a Mac App Store system installer into an install DMG that can be
-# restored to disk. Required from 10.11 El Capitan through 10.13 High Sierra,
-# which use the --applicationpath flag for createinstallmedia.
-#
-# $1 - Path to MAS install application given by user
-# $2 - macOS build string to verify (e.g. "15G31"); empty string skips check
-# $3 - Size of created DMG volume
-# $4 - Final name of installation DMG volume
-# $5 - Path to final destination of install DMG within restorekit
-# $6 - Display name of MAS install application
-# ------------------------------------------------------------------------------
-add_mas_createinstallmedia_yos () {
-
 	disp_print_header
 
-	# Verify the installer app contains the expected macOS build string.
-	# verify_installer_build checks InstallInfo.plist for 10.11–10.15 and mounts
-	# SharedSupport.dmg briefly for 11+. An empty build string always passes.
-	if verify_installer_build "$1" "$2"; then
+	echo "Creating $6 installation master DMG file..."
+	echo ""
 
-		disp_print_header
+	# Temp volume name is always FinalName + " temp"; the name createinstallmedia
+	# sets on the volume is always the app bundle name without the .app extension.
+	local newImageVolName="${4} temp"
+	local endName="${1##*/}"; endName="${endName%.app}"
 
-		echo "Creating $6 installation master DMG file..."
+	if ! add_create_install_dmg "$makedriveInstTmpImageFile" "$3" "$newImageVolName"; then
 		echo ""
-
-		# Temp volume name is always FinalName + " temp"; the name createinstallmedia
-		# sets on the volume is always the app bundle name without the .app extension.
-		local newImageVolName="${4} temp"
-		local endName="${1##*/}"; endName="${endName%.app}"
-
-		if ! add_create_install_dmg "$makedriveInstTmpImageFile" "$3" "$newImageVolName"; then
-			echo ""
-			echo "Could not create the temporary installer DMG. Check available disk space."
-			rm -f "$makedriveInstTmpImageFile"
-			echo ""
-			echo "Hit enter to continue."
-			read -r _
-			return 1
-		fi
-
+		echo "Could not create the temporary installer DMG. Check available disk space."
+		rm -f "$makedriveInstTmpImageFile"
 		echo ""
-		echo "Creating $6 bootable DMG..."
-		echo ""
+		disp_pause_for_input
+		return 1
+	fi
+
+	echo ""
+	echo "Creating $6 bootable DMG..."
+	echo ""
+
+	if [ "$7" = "yos" ]; then
 
 		local cimOrig="$1/Contents/Resources/createinstallmedia"
 		local cimBak="/var/tmp/makedrive-createinstallmedia-orig"
@@ -543,48 +431,106 @@ add_mas_createinstallmedia_yos () {
 			hdiutil detach -force "/Volumes/$endName" 2>/dev/null
 			rm -f "$makedriveInstTmpImageFile"
 			echo ""
-			echo "Hit enter to continue."
-			read -r _
+			disp_pause_for_input
 			return 1
 		fi
-
-		dmg_apply_volume_icon "$1" "/Volumes/$endName"
-
-		diskutil rename "/Volumes/$endName" "$4"
-
-		local appPathForReceiptWipe="${1#/Applications/}"
-
-		rm -rf "/Volumes/$4/$appPathForReceiptWipe/Contents/_MASReceipt/"
-
-		touch "/Volumes/$4/.metadata_never_index"
-
-		hdiutil detach -force "/Volumes/$4"
-
-		sleep 1
-
-		if ! mv "$makedriveInstTmpImageFile" "$5"; then
-			echo ""
-			echo "Could not move the completed DMG to restorekit. Check permissions and disk space."
-			echo ""
-			echo "Hit enter to continue."
-			read -r _
-			return 1
-		fi
-
-		dmgtool_compress_dmg "$5"
-		dmgtool_scan_dmg "$5"
-
-		echo ""
-		echo "$6 is ready for use. Hit enter to continue."
-		echo ""
 
 	else
 
-		add_mas_build_mismatch
+		if ! "$1/Contents/Resources/createinstallmedia" --volume "/Volumes/$newImageVolName" --nointeraction --downloadassets; then
+			echo ""
+			echo "createinstallmedia failed. Check the installer and available disk space,"
+			echo "then try again."
+			hdiutil detach -force "/Volumes/$newImageVolName" 2>/dev/null
+			hdiutil detach -force "/Volumes/$endName" 2>/dev/null
+			hdiutil detach -force "/Volumes/Shared Support" 2>/dev/null
+			rm -f "$makedriveInstTmpImageFile"
+			echo ""
+			disp_pause_for_input
+			return 1
+		fi
 
 	fi
 
-	read -r _
+	dmg_apply_volume_icon "$1" "/Volumes/$endName"
+
+	diskutil rename "/Volumes/$endName" "$4"
+
+	local appPathForReceiptWipe="${1#/Applications/}"
+
+	rm -rf "/Volumes/$4/$appPathForReceiptWipe/Contents/_MASReceipt/"
+
+	touch "/Volumes/$4/.metadata_never_index"
+
+	# checking workaround for new (2025 era) behavior for macOS Big Sur installer
+	# not properly unmounting causing creation process to fail compress and scan
+	# and using force after waiting for disk activity to wind down
+	[ "$7" != "yos" ] && sleep 3
+
+	hdiutil detach -force "/Volumes/$4"
+
+	sleep 1
+
+	if ! mv "$makedriveInstTmpImageFile" "$5"; then
+		echo ""
+		echo "Could not move the completed DMG to restorekit. Check permissions and disk space."
+		[ "$7" != "yos" ] && hdiutil detach -force "/Volumes/Shared Support" 2>/dev/null
+		echo ""
+		disp_pause_for_input
+		return 1
+	fi
+
+	# Detach the Shared Support volume left mounted by createinstallmedia (Mojave+ only).
+	[ "$7" != "yos" ] && hdiutil detach -force "/Volumes/Shared Support"
+
+	dmgtool_compress_dmg "$5"
+	dmgtool_scan_dmg "$5"
+
+	echo ""
+	echo "$6 is ready for use."
+	echo ""
+	disp_pause_for_input
+
+}
+
+
+# ------------------------------------------------------------------------------
+# add_mas_createinstallmedia
+# Processes a newer Mac App Store system installer into an install DMG that can
+# be restored to disk. Required on 10.14 Mojave and later because createinstallmedia
+# blesses the DMG root rather than a full OS volume, and must download assets
+# during creation.
+#
+# $1 - Path to MAS install application given by user
+# $2 - macOS build string to verify (e.g. "24G85"); empty string skips check
+# $3 - Size of created DMG volume
+# $4 - Final name of installation DMG volume
+# $5 - Path to final destination of install DMG within restorekit
+# $6 - Display name of MAS install application
+# ------------------------------------------------------------------------------
+add_mas_createinstallmedia () {
+
+	add_mas_createinstallmedia_impl "$1" "$2" "$3" "$4" "$5" "$6" ""
+
+}
+
+
+# ------------------------------------------------------------------------------
+# add_mas_createinstallmedia_yos
+# Processes a Mac App Store system installer into an install DMG that can be
+# restored to disk. Required from 10.11 El Capitan through 10.13 High Sierra,
+# which use the --applicationpath flag for createinstallmedia.
+#
+# $1 - Path to MAS install application given by user
+# $2 - macOS build string to verify (e.g. "15G31"); empty string skips check
+# $3 - Size of created DMG volume
+# $4 - Final name of installation DMG volume
+# $5 - Path to final destination of install DMG within restorekit
+# $6 - Display name of MAS install application
+# ------------------------------------------------------------------------------
+add_mas_createinstallmedia_yos () {
+
+	add_mas_createinstallmedia_impl "$1" "$2" "$3" "$4" "$5" "$6" "yos"
 
 }
 
@@ -594,25 +540,16 @@ add_mas_createinstallmedia_yos () {
 # ------------------------------------------------------------------------------
 add_menu_main () {
 
-	local leftCount leftColWidth addMenuIdx addMenuLabelVar addMenuLabel entryWidth
-	local leftKey leftNum leftLabelVar leftEntry
-	local rightIdx rightKey rightNum rightLabelVar rightEntry
-	local addMenuKey addFuncVar instPath appPathVar newImageVolSizeVar finalNameVar
-	local dispNameVar volNameVar buildNumVar sourcePathVar
+	local addMenuIdx addMenuLabelVar addMenuKey addFuncVar instPath
+	local appPathVar newImageVolSizeVar finalNameVar dispNameVar volNameVar buildNumVar sourcePathVar
+	local addMenuLabels=()
 
 	imageToAdd=""
 
-	# Split list into two columns at the ceiling midpoint; computed once since
-	# addMenuOrder is static after conf load.
-	leftCount=$(( (${#addMenuOrder[@]} + 1) / 2 ))
-	leftColWidth=0
-	for (( addMenuIdx = 0 ; addMenuIdx < leftCount ; addMenuIdx++ )); do
+	for (( addMenuIdx = 0 ; addMenuIdx < ${#addMenuOrder[@]} ; addMenuIdx++ )); do
 		addMenuLabelVar="${addMenuOrder[$addMenuIdx]}MenuLabel"
-		addMenuLabel="${!addMenuLabelVar}"
-		entryWidth=$(( ${#addMenuLabel} + 4 ))
-		if (( entryWidth > leftColWidth )); then leftColWidth=$entryWidth; fi
+		addMenuLabels+=( "$(printf "%2d. %s" $(( addMenuIdx + 1 )) "${!addMenuLabelVar}")" )
 	done
-	leftColWidth=$(( leftColWidth + 3 ))
 
 	while [ "$imageToAdd" == "" ]; do
 
@@ -621,23 +558,8 @@ add_menu_main () {
 		echo "Choose the software you'd like to add to the restorekit folder:"
 		echo ""
 
-		for (( addMenuIdx = 0 ; addMenuIdx < leftCount ; addMenuIdx++ )); do
-			leftKey="${addMenuOrder[$addMenuIdx]}"
-			leftNum=$(( addMenuIdx + 1 ))
-			leftLabelVar="${leftKey}MenuLabel"
-			leftEntry=$(printf "%2d. %s" "$leftNum" "${!leftLabelVar}")
+		disp_print_two_column_list addMenuLabels[@]
 
-			rightIdx=$(( addMenuIdx + leftCount ))
-			if (( rightIdx < ${#addMenuOrder[@]} )); then
-				rightKey="${addMenuOrder[$rightIdx]}"
-				rightNum=$(( rightIdx + 1 ))
-				rightLabelVar="${rightKey}MenuLabel"
-				rightEntry=$(printf "%2d. %s" "$rightNum" "${!rightLabelVar}")
-				printf "%-${leftColWidth}s%s\n" "$leftEntry" "$rightEntry"
-			else
-				printf "%s\n" "$leftEntry"
-			fi
-		done
 		echo ""
 		echo " X. Exit Image Installer"
 		echo ""
@@ -833,13 +755,11 @@ END { print n+0 }
 		    "$awkProg" "$confPath")
 		if [ "${changed:-0}" -gt 0 ] 2>/dev/null; then
 			mv "$tmpConf" "$confPath"
-		else
-			rm -f "$tmpConf"
-		fi
-		if [ "${changed:-0}" -gt 0 ] 2>/dev/null; then
 			makeDriveSyncNotice+="${makeDriveSyncNotice:+, }macOS ${dlVer} (${dlBuild})"
 			[ "$quiet" != "1" ] && echo "  makedrive.conf: ${instKey} updated ${confVer} → ${dlVer} (${dlBuild})"
 			anyUpdate=1
+		else
+			rm -f "$tmpConf"
 		fi
 	done
 
@@ -1097,9 +1017,9 @@ build_choose_target_device () {
 			disp_print_header
 			
 			echo "That disk number doesn't exist according to the OS. Choose another disk"
-			echo "to restore onto. Press enter to continue."
+			echo "to restore onto."
 			echo ""
-			read -r _
+			disp_pause_for_input
 			diskNum=""
 
 		# If the disk to image is a boot disk (bootDiskID may list more than one
@@ -1110,9 +1030,8 @@ build_choose_target_device () {
 			
 			echo "You are currently booted to a volume on disk$diskNum, and erasing disk$diskNum"
 			echo "would be an extremely bad idea.  Choose another disk to erase."
-			echo "Hit return to continue"
 			echo ""
-			read -r _
+			disp_pause_for_input
 			diskNum=""
 			
         # Asks if you are OK with erasing the drive that you just chose. If you
@@ -1161,36 +1080,135 @@ build_clean_vol_folder () {
 
 
 # ------------------------------------------------------------------------------
-# build_deploy_volume
-# Deploys the specified source to the specified volume using the arguments to
-# perform type-specific operations for smooth deployment.
+# deploy_restore_and_configure
+# Restores a disk image onto a prepared target volume, then renames, blesses,
+# disables Spotlight, and unmounts it. Called per-volume by build_deploy_volume
+# and directly by quick_deploy_start.
 #
-# The array indexes used in the construction of the strings is documented here:
-# @1 - Type of disk image to be restored, as defined in makedrive.conf
-# @2 - Display name of passed image
-# @3 - Path to passed disk image
-# @4 - Target volume starting name as formatted from diskutil
-# @5 - Master disk image's mounted volume name
-# @6 - Target volume final name to be seen by end user
+# $1 - deployType  (GENERIC or INST-A)
+# $2 - displayName
+# $3 - imagePath   (source DMG)
+# $4 - startName   (volume name of the prepared partition; ASR target)
+# $5 - asrName     (volume name after ASR: VolName for INST-A, FinalName for GENERIC)
+# $6 - finalName   (desired final volume name shown to the user)
+#
+# Uses globals:  diskNum, windowCloseSleepInSeconds, spotlightSleepInSeconds
+# Sets global:   lastBuildError
+# Returns:       0 success | 1 non-fatal error (rename/bless) | 2 fatal error (ASR)
+# ------------------------------------------------------------------------------
+deploy_restore_and_configure () {
+
+	local deployType="$1"
+	local displayName="$2"
+	local imagePath="$3"
+	local startName="$4"
+	local asrName="$5"
+	local finalName="$6"
+	local hadError=0
+
+	disp_print_header
+
+	echo "Setting up $displayName"
+	echo ""
+
+	# Mount all partitions on the target disk before restoring.
+	# Works around asr unmounting behavior on Catalina+ (FB6952557).
+	diskutil mountDisk "disk$diskNum"
+	sleep 2
+
+	echo "Restoring disk image to target volume."
+	echo ""
+	if ! asr restore --source "$imagePath" --target "/Volumes/$startName/" --erase --noprompt --noverify; then
+		lastBuildError="asr restore failed for $displayName."
+		echo ""
+		echo "asr restore failed for $displayName. The drive may be incomplete."
+		echo ""
+		disp_pause_for_input
+		return 2
+	fi
+	echo ""
+
+	# Close the Finder window opened by INST-A DMGs before rename
+	if [ "$deployType" = "INST-A" ]; then
+		sleep "$windowCloseSleepInSeconds"
+		osascript -e "tell application \"Finder\" to close Finder window \"$asrName\""
+	fi
+
+	# Rename to final name (INST-A only; GENERIC images already carry finalName)
+	if [ "$asrName" != "$finalName" ]; then
+		diskutil rename "/Volumes/$asrName" "$finalName"
+		if [ "$?" != "0" ] && [ "$hadError" = "0" ]; then
+			lastBuildError="Could not rename $asrName to $finalName."
+			hadError=1
+			echo "Warning: volume rename failed for $asrName. Drive may not be fully set up."
+		fi
+	fi
+
+	# Bless volume for boot capability
+	case "$deployType" in
+
+		INST-A )
+			mkdir "/Volumes/$finalName/.dummy"
+			if ! bless -folder "/Volumes/$finalName/System/Library/CoreServices" \
+			           -openfolder "/Volumes/$finalName/.dummy" \
+			           -label "$finalName"; then
+				[ "$hadError" = "0" ] && lastBuildError="$finalName could not be blessed and may not be bootable."
+				hadError=1
+				echo "Warning: bless failed for $finalName. Volume may not be bootable."
+			fi
+			rm -d "/Volumes/$finalName/.dummy"
+			;;
+
+		* )
+			if ! bless -folder "/Volumes/$finalName/System/Library/CoreServices" \
+			           -label "$finalName"; then
+				[ "$hadError" = "0" ] && lastBuildError="$finalName could not be blessed and may not be bootable."
+				hadError=1
+				echo "Warning: bless failed for $finalName. Volume may not be bootable."
+			fi
+			;;
+
+	esac
+
+	# Disable Spotlight on target volume
+	echo "Disabling Spotlight on target volume."
+	touch "/Volumes/$finalName/.metadata_never_index"
+	sleep "$spotlightSleepInSeconds"
+	mdutil -i off "/Volumes/$finalName"
+
+	# Unmount the target volume
+	echo "Unmounting volume now..."
+	diskutil unmount "/Volumes/$finalName"
+
+	return $hadError
+
+}
+
+
+# ------------------------------------------------------------------------------
+# build_deploy_volume
+# Iterates over a list of volume keys from makedrive.conf and deploys each one
+# to the formatted target disk. The dataDrive entry is handled inline; all
+# image volumes are dispatched to deploy_restore_and_configure.
+#
+# $1 - Name of array variable containing the ordered list of volume keys
 # ------------------------------------------------------------------------------
 build_deploy_volume () {
 
-	# Copy the passed array by name into a local array for indexed access.
 	local volumesToDeploy=("${!1}")
-	local deployInfoArray=()
 	local deployError=0
-	local volumeDeployCounter
-	local key varLookup
+	local volumeDeployCounter key varLookup
+	local deployType displayName imagePath startName asrName finalName
 
-    for (( volumeDeployCounter = 0 ; volumeDeployCounter < ${#volumesToDeploy[@]} ; volumeDeployCounter++ )); do
-		
-		disp_print_header
-		
+	for (( volumeDeployCounter = 0 ; volumeDeployCounter < ${#volumesToDeploy[@]} ; volumeDeployCounter++ )); do
+
 		if [ "${volumesToDeploy[$volumeDeployCounter]}" = "dataDrive" ]; then
-			
+
+			disp_print_header
+
 			# If the user chose to copy the contents of DataDrive
 			if [ "$okToCopyData" = "Y" ] || [ "$okToCopyData" = "y" ]; then
-		
+
 				echo "Cloning contents of data partition now..."
 				echo ""
 
@@ -1201,8 +1219,7 @@ build_deploy_volume () {
 					echo ""
 					echo "rsync to the data partition failed. The data partition may be incomplete."
 					echo ""
-					echo "Hit enter to continue."
-					read -r _
+					disp_pause_for_input
 				fi
 
 			else
@@ -1210,110 +1227,41 @@ build_deploy_volume () {
 			fi
 
 			diskutil rename "/Volumes/$dataDriveStartName" "$dataDriveFinalName"
-			renameResult=$?
-			if [ "$renameResult" != "0" ] && [ "$deployError" = "0" ]; then
+			if [ "$?" != "0" ] && [ "$deployError" = "0" ]; then
 				lastBuildError="Could not rename the DataDrive partition."
 				deployError=1
 			fi
 
-			# Bail out of the for loop and skip all of the unnecessary stuff
 			break
-		
+
 		fi
-		
+
 		key="${volumesToDeploy[$volumeDeployCounter]}"
 
-		varLookup="${key}DeployType";  deployInfoArray[1]="${!varLookup}"
-		varLookup="${key}DispName";    deployInfoArray[2]="${!varLookup}"
-		varLookup="${key}";            deployInfoArray[3]="${!varLookup}"
-		varLookup="${key}StartName";   deployInfoArray[4]="${!varLookup}"
-		varLookup="${key}FinalName";   deployInfoArray[6]="${!varLookup}"
+		varLookup="${key}DeployType";  deployType="${!varLookup}"
+		varLookup="${key}DispName";    displayName="${!varLookup}"
+		varLookup="${key}";            imagePath="${!varLookup}"
+		varLookup="${key}StartName";   startName="${!varLookup}"
+		varLookup="${key}FinalName";   finalName="${!varLookup}"
 		# INST-A DMGs restore with the source volume name (e.g. "Mac OS X Install ESD"),
 		# which must be renamed to FinalName. GENERIC DMGs already have FinalName as
 		# their volume name so VolName is not stored in conf for them.
-		if [ "${deployInfoArray[1]}" = "INST-A" ]; then
-			varLookup="${key}VolName"; deployInfoArray[5]="${!varLookup}"
+		if [ "$deployType" = "INST-A" ]; then
+			varLookup="${key}VolName";  asrName="${!varLookup}"
 		else
-			deployInfoArray[5]="${deployInfoArray[6]}"
+			asrName="$finalName"
 		fi
-		
-		# To fix Catalina's weird asr unmounting behavior, try to have it mount everything
-		# on the target disk device every time. Hopefully it stops the deployment failures
-		# until they fix it for APFS restores. Feedback report FB6952557
-		diskutil mountDisk disk"$diskNum"
-		sleep 2
-		
-		
-		# This is where the magic happens.
-		echo "Setting up ${deployInfoArray[2]}"
-		echo ""
-	
-		# Get the desired data onto the target volume by restoring the source DMG.
-		echo "Restoring disk image to target volume."
-		echo ""
-		if ! asr restore --source "${deployInfoArray[3]}" --target "/Volumes/${deployInfoArray[4]}/" --erase --noprompt --noverify; then
-			lastBuildError="asr restore failed for ${deployInfoArray[2]}."
+
+		lastBuildError=""
+		deploy_restore_and_configure "$deployType" "$displayName" "$imagePath" \
+			"$startName" "$asrName" "$finalName"
+		local rc=$?
+		if [ "$rc" = "2" ]; then
 			deployError=1
-			echo ""
-			echo "asr restore failed for ${deployInfoArray[2]}. The drive may be incomplete."
-			echo ""
-			echo "Hit enter to continue."
-			read -r _
 			break
-		fi
-		echo ""
-
-		# Close the Finder window opened by INST-A DMGs
-		if [ "${deployInfoArray[1]}" == "INST-A" ]; then
-
-			sleep "$windowCloseSleepInSeconds"
-			osascript -e "tell application \"Finder\" to close Finder window \"${deployInfoArray[5]}\""
-
-		fi
-
-		# Rename each volume appropriately
-		diskutil rename "/Volumes/${deployInfoArray[5]}" "${deployInfoArray[6]}"
-		renameResult=$?
-		if [ "$renameResult" != "0" ] && [ "$deployError" = "0" ]; then
-			lastBuildError="Could not rename ${deployInfoArray[5]} to ${deployInfoArray[6]}."
+		elif [ "$rc" = "1" ]; then
 			deployError=1
-			echo "Warning: volume rename failed for ${deployInfoArray[5]}. Drive may not be fully set up."
 		fi
-
-		# Bless volume appropriately
-		case "${deployInfoArray[1]}" in
-
-			INST-A	)
-				mkdir "/Volumes/${deployInfoArray[6]}/.dummy"
-				if ! bless -folder "/Volumes/${deployInfoArray[6]}/System/Library/CoreServices" -openfolder "/Volumes/${deployInfoArray[6]}/.dummy" -label "${deployInfoArray[6]}"; then
-					lastBuildError="${deployInfoArray[6]} could not be blessed and may not be bootable."
-					deployError=1
-					echo "Warning: bless failed for ${deployInfoArray[6]}. Volume may not be bootable."
-				fi
-				rm -d "/Volumes/${deployInfoArray[6]}/.dummy"
-				;;
-
-			*	)
-				if ! bless -folder "/Volumes/${deployInfoArray[6]}/System/Library/CoreServices" -label "${deployInfoArray[6]}"; then
-					lastBuildError="${deployInfoArray[6]} could not be blessed and may not be bootable."
-					deployError=1
-					echo "Warning: bless failed for ${deployInfoArray[6]}. Volume may not be bootable."
-				fi
-				;;
-
-		esac
-	
-		# Disable Spotlight on target volume
-		echo "Disabling Spotlight on target volume."
-		touch "/Volumes/${deployInfoArray[6]}/.metadata_never_index"
-		sleep "$spotlightSleepInSeconds"
-		mdutil -i off "/Volumes/${deployInfoArray[6]}"
-	
-		# Unmount the target volume.
-		echo "Unmounting volume now..."
-		diskutil unmount "/Volumes/${deployInfoArray[6]}"
-		
-		unset deployInfoArray
 
 	done
 
@@ -1356,7 +1304,7 @@ build_drives_start () {
 		build_run_build_task
 		local buildTaskResult=$?
 
-		diskutil eject disk"$diskNum"
+		diskutil eject "disk$diskNum"
 
 		if [ "$buildTaskResult" = "0" ]; then
 			notify_pushover_send "Your installation drive has finished imaging."
@@ -1501,11 +1449,199 @@ build_run_build_task () {
 		echo ""
 		echo "Disk partitioning failed. The drive was not modified."
 		echo ""
-		echo "Hit enter to continue."
-		read -r _
+		disp_pause_for_input
 		return 1
 	fi
 	build_deploy_volume configVolumeList[@]
+
+}
+
+
+# ------------------------------------------------------------------------------
+# quick_deploy_menu_choose_image
+# Displays available deployment images and returns the selected image key
+# ------------------------------------------------------------------------------
+quick_deploy_menu_choose_image () {
+
+	local selectedImageNum selectedImageKey key dispNameVar menuIndex=1
+	local deployableImages=()
+	local menuLabels=()
+
+	# Build arrays of all configured images and matching display labels once
+	for key in "${addMenuOrder[@]}"; do
+		dispNameVar="${key}DispName"
+		menuLabels+=( "$(printf "%2d. %s" "$menuIndex" "${!dispNameVar}")" )
+		deployableImages+=("$key")
+		(( menuIndex++ ))
+	done
+
+	if [ "${#deployableImages[@]}" -eq 0 ]; then
+		disp_print_header
+		echo "No deployment images are configured in makedrive.conf"
+		echo ""
+		disp_pause_for_input "Hit enter to return to the main menu."
+		return 1
+	fi
+
+	while [ -z "$selectedImageKey" ]; do
+
+		disp_print_header
+
+		echo "Choose the image you'd like to restore to a USB or SD card:"
+		echo ""
+
+		disp_print_two_column_list menuLabels[@]
+
+		echo ""
+		echo " X. Exit to main menu"
+		echo ""
+		echo "Enter the number for the image you'd like to restore and hit return: "
+		echo ""
+		read -r selectedImageNum
+
+		case "$selectedImageNum" in
+
+		[Xx] )
+			return 1
+			;;
+
+		* )
+			if [ "$selectedImageNum" -ge 1 ] 2>/dev/null && [ "$selectedImageNum" -le "${#deployableImages[@]}" ] 2>/dev/null; then
+				selectedImageKey="${deployableImages[$((selectedImageNum - 1))]}"
+			fi
+			;;
+
+		esac
+
+	done
+
+	quickDeployImageKey="$selectedImageKey"
+	return 0
+
+}
+
+
+# ------------------------------------------------------------------------------
+# quick_deploy_format_disk
+# Formats target disk with a single partition for deployment.
+# GPT is always used — quick deploy targets modern USB/SD media.
+#
+# $1 - Disk number to partition
+# $2 - Volume name for the partition
+# $3 - Filesystem type (e.g. JHFS+); defaults to JHFS+ if omitted
+# ------------------------------------------------------------------------------
+quick_deploy_format_disk () {
+
+	local diskNum="$1"
+	local volumeName="$2"
+	local volType="${3:-JHFS+}"
+
+	disp_print_header
+
+	echo "Preparing disk$diskNum for restoration..."
+	echo ""
+
+	# Unmount all volumes on the disk
+	diskutil unmountDisk force "disk$diskNum"
+
+	if ! diskutil partitionDisk "disk$diskNum" 1 GPT "$volType" "$volumeName" 0; then
+		return 1
+	fi
+
+	return 0
+
+}
+
+
+# ------------------------------------------------------------------------------
+# quick_deploy_start
+# Main loop for restoring a single image to a USB drive or SD card.
+# Loads conf vars for the chosen image key and calls deploy_restore_and_configure
+# directly — no DataDrive copy, no multi-volume iteration.
+# ------------------------------------------------------------------------------
+quick_deploy_start () {
+
+	local doDeploy="Y"
+	local diskNum=""
+
+	while [ "$doDeploy" = "Y" ] || [ "$doDeploy" = "y" ]; do
+
+		if ! quick_deploy_menu_choose_image; then
+			break
+		fi
+
+		local key="$quickDeployImageKey"
+		local varLookup deployType displayName imagePath startName asrName finalName volType
+
+		varLookup="${key}DeployType";  deployType="${!varLookup}"
+		varLookup="${key}DispName";    displayName="${!varLookup}"
+		varLookup="${key}";            imagePath="${!varLookup}"
+		varLookup="${key}StartName";   startName="${!varLookup}"
+		varLookup="${key}FinalName";   finalName="${!varLookup}"
+		varLookup="${key}VolType";     volType="${!varLookup}"
+		if [ "$deployType" = "INST-A" ]; then
+			varLookup="${key}VolName";  asrName="${!varLookup}"
+		else
+			asrName="$finalName"
+		fi
+
+		disp_print_header
+
+		if [ ! -f "$imagePath" ]; then
+			echo "The selected image could not be found at:"
+			echo "$imagePath"
+			echo ""
+			disp_pause_for_input
+			continue
+		fi
+
+		diskNum=""
+		build_choose_target_device
+
+		if [ "$diskNum" = "X" ] || [ "$diskNum" = "x" ] || [ -z "$diskNum" ]; then
+			diskNum=""
+			continue
+		fi
+
+		if ! quick_deploy_format_disk "$diskNum" "$startName" "$volType"; then
+			disp_print_header
+			echo "Disk preparation failed. The drive was not modified."
+			echo ""
+			disp_pause_for_input
+			diskNum=""
+			continue
+		fi
+
+		lastBuildError=""
+		deploy_restore_and_configure "$deployType" "$displayName" "$imagePath" \
+			"$startName" "$asrName" "$finalName"
+		local deployRC=$?
+
+		disp_print_header
+		echo "Ejecting disk..."
+		diskutil eject "disk$diskNum"
+
+		if [ "$deployRC" = "0" ] && [ -z "$lastBuildError" ]; then
+			notify_pushover_send "Your USB/SD card has finished imaging."
+		else
+			notify_pushover_send "An error was encountered during imaging: ${lastBuildError}"
+		fi
+
+		disp_print_header
+		echo "Completed disk is ejected."
+		echo ""
+		echo "If you want to image another drive, connect it before answering 'yes'."
+		echo ""
+		echo "Do you want to image another drive? Y/N: "
+		echo ""
+		read -r doDeploy
+		doDeploy="${doDeploy%% *}"
+
+		diskNum=""
+
+	done
+
+	return 0
 
 }
 
@@ -1525,11 +1661,7 @@ check_file_presence () {
 	for (( imagePresenceCounter = 0 ; imagePresenceCounter < ${#imageFilePaths[@]} ; imagePresenceCounter++ )); do
 
 		if [ ! -e "${imageFilePaths[$imagePresenceCounter]}" ]; then
-			
-			tempDMGholding="${imageFilePaths[$imagePresenceCounter]##*/}"
-			missingDMGs+="$tempDMGholding \n"
-			tempDMGholding=""
-			
+			missingDMGs+="${imageFilePaths[$imagePresenceCounter]##*/} \n"
 		fi
 		
 	done
@@ -1564,10 +1696,9 @@ dmgtool_compress_dmg () {
 
 	disp_print_header
 	
-	if ! hdiutil imageinfo "$1" | grep "$dmgCompressionString"; then
+	if ! hdiutil imageinfo "$1" | grep -q "$dmgCompressionString"; then
 		
-		compressingNow="${1##*/}"
-		echo "Compressing $compressingNow"
+		echo "Compressing ${1##*/}"
 		echo ""
 		
 		if [ "$3" != "" ]; then
@@ -1581,15 +1712,22 @@ dmgtool_compress_dmg () {
 			return 1
 
 		else
-			
+
 			# Rename original aside, move compressed into place, then remove original.
 			# Staging the rename means the original is recoverable if the second mv fails.
-			mv "$1" "$1.old.dmg"
-			mv "$1.new.dmg" "$1"
+			if ! mv "$1" "$1.old.dmg"; then
+				rm -f "$1.new.dmg"
+				return 1
+			fi
+			if ! mv "$1.new.dmg" "$1"; then
+				mv "$1.old.dmg" "$1"
+				rm -f "$1.new.dmg"
+				return 1
+			fi
 			rm -f "$1.old.dmg"
-		
+
 			return 0
-		
+
 		fi
 		
 	else
@@ -1613,10 +1751,9 @@ dmgtool_scan_dmg () {
 	disp_print_header
 	
 	
-	if ! hdiutil imageinfo "$1" | grep --text 'CRC32'; then
+	if ! hdiutil imageinfo "$1" | grep -q --text 'CRC32'; then
 		
-		scanningNow="${1##*/}"
-		echo "Scanning $scanningNow for restore"
+		echo "Scanning ${1##*/} for restore"
 		echo ""
 
 		if [ "$3" != "" ]; then
@@ -1654,8 +1791,57 @@ disp_print_header () {
 	echo "makedrive version $currentVersion"
 	date
 	echo ""
-	
+
 	return 0
+}
+
+
+# ------------------------------------------------------------------------------
+# disp_pause_for_input
+# Prints a prompt and waits for the user to press return. Centralises the
+# "Hit enter to continue." pattern used throughout the script.
+#
+# $1 - Optional prompt string (default: "Hit enter to continue.")
+# ------------------------------------------------------------------------------
+disp_pause_for_input () {
+
+	local message="${1:-Hit enter to continue.}"
+	echo "$message"
+	read -r _
+
+}
+
+
+# ------------------------------------------------------------------------------
+# disp_print_two_column_list
+# Prints an array of pre-formatted strings in two balanced columns.
+# Left column width is determined by the longest entry in the left half.
+#
+# $1 - Array variable to print, passed by name (e.g. myArray[@])
+# ------------------------------------------------------------------------------
+disp_print_two_column_list () {
+
+	local items=("${!1}")
+	local count=${#items[@]}
+	local leftCount=$(( (count + 1) / 2 ))
+	local leftColWidth=0
+	local i w rightIdx
+
+	for (( i = 0 ; i < leftCount ; i++ )); do
+		w=${#items[$i]}
+		(( w > leftColWidth )) && leftColWidth=$w
+	done
+	leftColWidth=$(( leftColWidth + 3 ))
+
+	for (( i = 0 ; i < leftCount ; i++ )); do
+		rightIdx=$(( i + leftCount ))
+		if (( rightIdx < count )); then
+			printf "%-${leftColWidth}s%s\n" "${items[$i]}" "${items[$rightIdx]}"
+		else
+			printf "%s\n" "${items[$i]}"
+		fi
+	done
+
 }
 
 
@@ -1686,9 +1872,11 @@ main_menu () {
 		echo ""
 		echo -e "\033[1m3. Build your install drive\033[0m"
 		echo ""
-		echo -e "\033[1m4. Configure Pushover notifications\033[0m"
+		echo -e "\033[1m4. Restore image to USB or SD card\033[0m"
 		echo ""
-		echo -e "\033[1m5. Uninstall makedrive from this Mac\033[0m"
+		echo -e "\033[1m5. Configure Pushover notifications\033[0m"
+		echo ""
+		echo -e "\033[1m6. Uninstall makedrive from this Mac\033[0m"
 		echo ""
 		echo -e "\033[1mX. Exit makedrive\033[0m"
 		echo ""
@@ -1712,10 +1900,14 @@ main_menu () {
 			;;
 
 		4 )
-			notify_pushover_setup
+			quick_deploy_start
 			;;
 
 		5 )
+			notify_pushover_setup
+			;;
+
+		6 )
 			makedrive_uninstall
 			;;
 
@@ -1732,6 +1924,44 @@ main_menu () {
 	done
 	
 	return 0
+}
+
+
+# ------------------------------------------------------------------------------
+# notify_pushover_read_userkey / notify_pushover_read_apptoken
+# Read a single Pushover credential from the System Keychain and print it to
+# stdout. Returns an empty string silently when the credential is not present.
+# ------------------------------------------------------------------------------
+notify_pushover_read_userkey () {
+	security find-generic-password \
+		-s "makedrive-pushover-userkey" \
+		-a "makedrive" \
+		-w \
+		/Library/Keychains/System.keychain 2>/dev/null
+}
+
+notify_pushover_read_apptoken () {
+	security find-generic-password \
+		-s "makedrive-pushover-apptoken" \
+		-a "makedrive" \
+		-w \
+		/Library/Keychains/System.keychain 2>/dev/null
+}
+
+
+# ------------------------------------------------------------------------------
+# notify_pushover_delete_credentials
+# Removes both Pushover keychain entries. Silently ignores missing entries.
+# ------------------------------------------------------------------------------
+notify_pushover_delete_credentials () {
+	security delete-generic-password \
+		-s "makedrive-pushover-userkey" \
+		-a "makedrive" \
+		/Library/Keychains/System.keychain 2>/dev/null
+	security delete-generic-password \
+		-s "makedrive-pushover-apptoken" \
+		-a "makedrive" \
+		/Library/Keychains/System.keychain 2>/dev/null
 }
 
 
@@ -1755,16 +1985,7 @@ notify_pushover_remove () {
 
 	if [ "$confirmRemove" = "Y" ] || [ "$confirmRemove" = "y" ]; then
 
-		security delete-generic-password \
-			-s "makedrive-pushover-userkey" \
-			-a "makedrive" \
-			/Library/Keychains/System.keychain 2>/dev/null
-
-		security delete-generic-password \
-			-s "makedrive-pushover-apptoken" \
-			-a "makedrive" \
-			/Library/Keychains/System.keychain 2>/dev/null
-
+		notify_pushover_delete_credentials
 		echo "Pushover credentials removed from the System Keychain."
 		echo "makedrive will no longer send Pushover notifications."
 
@@ -1773,8 +1994,7 @@ notify_pushover_remove () {
 	fi
 
 	echo ""
-	echo "Hit enter to continue."
-	read -r _
+	disp_pause_for_input
 
 }
 
@@ -1811,8 +2031,7 @@ makedrive_uninstall () {
 		echo ""
 		echo "Uninstall cancelled."
 		echo ""
-		echo "Hit enter to continue."
-		read -r _
+		disp_pause_for_input
 		return 0
 	fi
 
@@ -1826,14 +2045,7 @@ makedrive_uninstall () {
 
 	if security find-generic-password -s "makedrive-pushover-userkey" -a "makedrive" \
 			/Library/Keychains/System.keychain &>/dev/null; then
-		security delete-generic-password \
-			-s "makedrive-pushover-userkey" \
-			-a "makedrive" \
-			/Library/Keychains/System.keychain 2>/dev/null
-		security delete-generic-password \
-			-s "makedrive-pushover-apptoken" \
-			-a "makedrive" \
-			/Library/Keychains/System.keychain 2>/dev/null
+		notify_pushover_delete_credentials
 		echo "  Pushover credentials removed from the System Keychain."
 	fi
 
@@ -1867,17 +2079,8 @@ notify_pushover_send () {
 
 	local userKey appToken
 
-	userKey=$(security find-generic-password \
-		-s "makedrive-pushover-userkey" \
-		-a "makedrive" \
-		-w \
-		/Library/Keychains/System.keychain 2>/dev/null)
-
-	appToken=$(security find-generic-password \
-		-s "makedrive-pushover-apptoken" \
-		-a "makedrive" \
-		-w \
-		/Library/Keychains/System.keychain 2>/dev/null)
+	userKey=$(notify_pushover_read_userkey)
+	appToken=$(notify_pushover_read_apptoken)
 
 	if [ -z "$userKey" ] || [ -z "$appToken" ]; then return 0; fi
 
@@ -1987,8 +2190,7 @@ notify_pushover_setup () {
 			fi
 
 			echo ""
-			echo "Hit enter to continue."
-			read -r _
+			disp_pause_for_input
 			pushoverMenuChoice=""
 			;;
 
@@ -1996,8 +2198,7 @@ notify_pushover_setup () {
 			disp_print_header
 			notify_pushover_test
 			echo ""
-			echo "Hit enter to continue."
-			read -r _
+			disp_pause_for_input
 			pushoverMenuChoice=""
 			;;
 
@@ -2030,17 +2231,8 @@ notify_pushover_test () {
 
 	local userKey appToken testStatus
 
-	userKey=$(security find-generic-password \
-		-s "makedrive-pushover-userkey" \
-		-a "makedrive" \
-		-w \
-		/Library/Keychains/System.keychain 2>/dev/null)
-
-	appToken=$(security find-generic-password \
-		-s "makedrive-pushover-apptoken" \
-		-a "makedrive" \
-		-w \
-		/Library/Keychains/System.keychain 2>/dev/null)
+	userKey=$(notify_pushover_read_userkey)
+	appToken=$(notify_pushover_read_apptoken)
 
 	if [ -z "$userKey" ] || [ -z "$appToken" ]; then
 		echo "No Pushover credentials found in the keychain."
@@ -2082,17 +2274,8 @@ notify_pushover_test () {
 # ------------------------------------------------------------------------------
 postflight_cleanup () {
 
-	if [ -e "$makedriveLockFile" ]; then
-		
-		rm "$makedriveLockFile"
-	
-	fi
-
-	if [ -e "$makedriveInstTmpImageFile" ]; then
-		
-		rm "$makedriveInstTmpImageFile"
-	
-	fi
+	rm -f "$makedriveLockFile"
+	rm -f "$makedriveInstTmpImageFile"
 	
 	if [ -d "$executionPath/restorekit" ]; then
 		chmod -RN "$executionPath/restorekit"
@@ -2140,8 +2323,7 @@ preflight_check_for_restorekit () {
 				echo ""
 				echo "Could not create the restorekit folder. Check permissions and try again."
 				echo ""
-				echo "Hit enter to exit makedrive."
-				read -r _
+				disp_pause_for_input "Hit enter to exit makedrive."
 				exit 1
 			fi
 			;;
@@ -2238,10 +2420,10 @@ preflight_check_root () {
 		echo "Welcome to makedrive!"
 		echo ""
 		echo "This script is intended for the rapid deployment and distribution of"
-		echo "diagnostic hard disks and flash drives. Though many precautions have"
-		echo "been taken to prevent data loss, there is still the chance of a"
-		echo "problem making your day a bit harder. Back up your important"
-		echo "data before using this script on a mission-critical computer."
+		echo "macOS install drives. Though many precautions have been taken to"
+		echo "prevent data loss, there is still the chance of a problem making"
+		echo "your day a bit harder. Back up your important data before using"
+		echo "this script on a mission-critical computer."
 		echo ""
 		echo "makedrive must be run as root for proper operation."
 		echo ""
@@ -2333,8 +2515,7 @@ preflight_check_xcode_cli_tools () {
 			echo ""
 			echo "Follow the prompts to complete installation, then run makedrive again."
 			echo ""
-			echo "Hit enter to exit makedrive."
-			read -r _
+			disp_pause_for_input "Hit enter to exit makedrive."
 			exit 1
 			;;
 
@@ -2397,8 +2578,7 @@ preflight_get_boot_device () {
         echo "the computer, and run makedrive again.  Note that makedrive will not run"
         echo "without first determining the startup disk for data safety reasons."
         echo ""
-        echo "Hit enter to exit makedrive."
-        read -r _
+        disp_pause_for_input "Hit enter to exit makedrive."
         exit 1
 
     else
@@ -2426,7 +2606,7 @@ preflight_get_execution_path () {
 process_check_dmgs () {
 
 	local imageCheckCounter imageCompressCounter imageScanCounter imageFailCounter
-	local compCount needComp scanCount needScan
+	local compressionPresent scanInfoPresent compressResult scanResult
 
 	imagesNeedingCompression=()
 	imagesThatFailedCompression=()
@@ -2443,7 +2623,7 @@ process_check_dmgs () {
 		echo ""
 
 		[ -e "${imageFilePaths[$imageCheckCounter]}" ] || continue
-		hdiutil imageinfo "${imageFilePaths[$imageCheckCounter]}" | grep "$dmgCompressionString"
+		hdiutil imageinfo "${imageFilePaths[$imageCheckCounter]}" | grep -q "$dmgCompressionString"
 		compressionPresent=$?
 	
 		# If hdiutil/grep returns not 0 (non-success, image is not correct format), then 
@@ -2463,11 +2643,8 @@ process_check_dmgs () {
 		
 		for (( imageCompressCounter = 0 ; imageCompressCounter < ${#imagesNeedingCompression[@]} ; imageCompressCounter++ )); do
 
-			compCount=$(( imageCompressCounter + 1 ))
-			needComp=${#imagesNeedingCompression[@]}
-			
-		
-			dmgtool_compress_dmg "${imagesNeedingCompression[$imageCompressCounter]}" "$compCount" "$needComp"
+			dmgtool_compress_dmg "${imagesNeedingCompression[$imageCompressCounter]}" \
+				"$(( imageCompressCounter + 1 ))" "${#imagesNeedingCompression[@]}"
 			compressResult=$?
 
 			# If dmgtool_compress_dmg returns not 0 (non-success, cannot scan
@@ -2494,7 +2671,7 @@ process_check_dmgs () {
 		echo ""
 
 		[ -e "${imageFilePaths[$imageCheckCounter]}" ] || continue
-		hdiutil imageinfo "${imageFilePaths[$imageCheckCounter]}" | grep --text 'CRC32'
+		hdiutil imageinfo "${imageFilePaths[$imageCheckCounter]}" | grep -q --text 'CRC32'
 		scanInfoPresent=$?
 	
 		# If 2nd grep returns not 0 (non-success, no checksum is found), then 
@@ -2516,10 +2693,8 @@ process_check_dmgs () {
 		
 		for (( imageScanCounter = 0 ; imageScanCounter < ${#imagesNeedingScan[@]} ; imageScanCounter++ )); do
 
-			scanCount=$(( imageScanCounter + 1 ))
-			needScan=${#imagesNeedingScan[@]}
-		
-			dmgtool_scan_dmg "${imagesNeedingScan[$imageScanCounter]}" "$scanCount" "$needScan"
+			dmgtool_scan_dmg "${imagesNeedingScan[$imageScanCounter]}" \
+				"$(( imageScanCounter + 1 ))" "${#imagesNeedingScan[@]}"
 			scanResult=$?
 
 			# If dmgtool_scan_dmg returns not 0 (non-success, cannot scan
@@ -2571,10 +2746,9 @@ process_check_dmgs () {
 	fi
 
 	echo ""
-	echo "Hit enter to continue... "
+	disp_pause_for_input
 	echo ""
-	read -r _
-	
+
 	return 0
 }
 
