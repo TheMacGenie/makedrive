@@ -4046,19 +4046,88 @@ preflight_get_execution_path
 # is checked last as a one-time upgrade fallback for pre-Build 202 installs.
 _makedrive_legacy_conf="/Library/Application Support/makedrive/makedrive.conf"
 if [ -f "$executionPath/makedrive.conf" ]; then
-	# shellcheck source=/dev/null
-	. "$executionPath/makedrive.conf"
+	_makedrive_active_conf="$executionPath/makedrive.conf"
 elif [ -f "$makedriveSupportConf" ]; then
-	# shellcheck source=/dev/null
-	. "$makedriveSupportConf"
+	_makedrive_active_conf="$makedriveSupportConf"
 elif [ -f "$_makedrive_legacy_conf" ]; then
-	# shellcheck source=/dev/null
-	. "$_makedrive_legacy_conf"
+	_makedrive_active_conf="$_makedrive_legacy_conf"
 else
 	echo "makedrive configuration file not found."
 	echo "Place makedrive.conf alongside makedrive.command and re-run to install it."
 	exit 1
 fi
+# shellcheck source=/dev/null
+. "$_makedrive_active_conf"
+
+# ------------------------------------------------------------------------------
+# Configuration derivation
+# Values computed from makedrive.conf rather than hand-maintained there, so
+# they can't drift out of sync with the image/build-type blocks that back them.
+# ------------------------------------------------------------------------------
+
+# addMenuOrder lists installer keys oldest to newest, derived from every
+# instXXXXMenuLabel key in makedrive.conf (reversed, since new blocks are added
+# at the top of that file) so an image block can be added or removed there
+# without also editing this list. imageFilePaths derives from it for
+# presence/compression/scan checks.
+addMenuOrder=()
+while IFS= read -r _menuKey; do
+	addMenuOrder+=( "$_menuKey" )
+done < <(grep -o '^inst[A-Za-z0-9]*MenuLabel=' "$_makedrive_active_conf" | sed 's/MenuLabel=$//' | tail -r)
+unset _menuKey
+imageFilePaths=()
+for _key in "${addMenuOrder[@]}"; do imageFilePaths+=( "${!_key}" ); done
+unset _key
+
+# buildTypeXX_detail is derived, for any type number in buildTypeNums, from
+# the VolSize (not NewImageVolSize) of every non-dataDrive key in that type's
+# buildTypeXX_volumes array in makedrive.conf, summed and rounded up to the
+# nearest 10GB - so it stays correct regardless of which type number a build
+# type is given, or which keys it lists there. A type left with no
+# buildTypeXX_detail at all in makedrive.conf gets one computed here; a type
+# that already defines one there (e.g. DataDrive Only, whose "0G = use
+# remaining space" volume isn't summable) is left untouched.
+_bt_detail_size () {
+	local _key _sizeVar _sizes=""
+	for _key in "$@"; do
+		[ "$_key" = "dataDrive" ] && continue
+		_sizeVar="${_key}VolSize"
+		_sizes="$_sizes ${!_sizeVar%G}"
+	done
+	awk -v vals="$_sizes" 'BEGIN {
+		n = split(vals, a, " ")
+		total = 0
+		for (i = 1; i <= n; i++) total += a[i]
+		c = int(total / 10)
+		if (c * 10 < total) c++
+		printf "%d", c * 10
+	}'
+}
+for _btNum in "${buildTypeNums[@]}"; do
+	_btDetailVar="buildType${_btNum}_detail"
+	[ -n "${!_btDetailVar}" ] && continue
+
+	_btVols=()
+	eval "_btVols=( \"\${buildType${_btNum}_volumes[@]}\" )"
+
+	_btHasImageKey=0 _btHasDataDrive=0
+	for _btVolKey in "${_btVols[@]}"; do
+		if [ "$_btVolKey" = "dataDrive" ]; then
+			_btHasDataDrive=1
+		else
+			_btHasImageKey=1
+		fi
+	done
+	[ "$_btHasImageKey" = "0" ] && continue
+
+	if [ "$_btHasDataDrive" = "1" ]; then
+		printf -v "$_btDetailVar" 'About %sGB plus DataDrive' "$(_bt_detail_size "${_btVols[@]}")"
+	else
+		printf -v "$_btDetailVar" 'About %sGB' "$(_bt_detail_size "${_btVols[@]}")"
+	fi
+done
+unset -f _bt_detail_size
+unset _btNum _btDetailVar _btVols _btHasImageKey _btHasDataDrive _btVolKey
 
 # Performing individual checks once at start of execution, rather than every run
 # through the main application loop
@@ -4078,7 +4147,7 @@ if [ -f "$executionPath/makedrive.conf" ]; then
 elif [ -f "$_makedrive_legacy_conf" ] && [ ! -f "$makedriveSupportConf" ]; then
 	migrate_conf_file "$_makedrive_legacy_conf" "$makedriveSupportConf" "$makedriveSupportDir"
 fi
-unset _makedrive_legacy_conf
+unset _makedrive_legacy_conf _makedrive_active_conf
 
 # Ensure the support directory and its contents are owned by the invoking user
 # so makedrive.conf can be edited without elevated privileges. makedrive runs as
