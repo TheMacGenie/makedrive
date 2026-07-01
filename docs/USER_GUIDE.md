@@ -603,6 +603,18 @@ longer build those images at all.
 
 Full release history is in [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
 
+### Build 202 - 2026-07-01
+
+- **Configuration derivation:** addMenuOrder, buildTypeNums, and build type
+  size estimates are now derived automatically from makedrive.conf's image
+  and build-type blocks.
+- **Build type renumbering:** build types are now numbered 1, 2, and 3
+  (previously 10, 11, and 12, a leftover from a subsystem removed in Build
+  200).
+- **Documentation corrections:** makedrive.conf's location (per-user
+  Application Support, not system-wide) and Pushover credential storage (the
+  login keychain, not the System Keychain) are now described correctly.
+
 ### Build 201 - 2026-06-30
 
 - **EFI volume icons now present correctly in old and new style EFI.**
