@@ -2135,14 +2135,22 @@ build_ask_to_copy_datadrive () {
 	# of the other junk on it, you can elect to not copy the large data
 	# partition. Otherwise, it's a good idea to copy the whole thing.
 	while [ "$okToCopyData" = "" ]; do
-		
+
 		disp_print_header
 
-		# DataDrive Only (type 12) always copies the data partition - it's the
-		# entire point of that build type, so skip the prompt.
-		if [ "$diskType" == "12" ]; then
+		# A build type whose volumes are dataDrive only (e.g. "DataDrive Only")
+		# always copies the data partition - it's the entire point of that
+		# build type, so skip the prompt. Checked by volume composition rather
+		# than a specific type number, since that number can change in
+		# makedrive.conf.
+		local _volumesRef="buildType${diskType}_volumes[@]"
+		local _hasImageKey=0 _volKey
+		for _volKey in "${!_volumesRef}"; do
+			[ "$_volKey" != "dataDrive" ] && _hasImageKey=1
+		done
+		if [ "$_hasImageKey" = "0" ]; then
 			okToCopyData="Y"
-			
+
 		else
 			echo "Do you want to copy the contents of the data partition to disk$diskNum?"
 			echo ""
@@ -4078,6 +4086,16 @@ unset _menuKey
 imageFilePaths=()
 for _key in "${addMenuOrder[@]}"; do imageFilePaths+=( "${!_key}" ); done
 unset _key
+
+# buildTypeNums (the registry of valid type numbers, in menu display order)
+# is derived from every buildTypeXX_label key in makedrive.conf, sorted
+# numerically ascending, so a build type can be added, removed, or renumbered
+# there without also editing this list.
+buildTypeNums=()
+while IFS= read -r _btLabelNum; do
+	buildTypeNums+=( "$_btLabelNum" )
+done < <(grep -o '^buildType[0-9][0-9]*_label=' "$_makedrive_active_conf" | sed 's/^buildType//; s/_label=$//' | sort -n)
+unset _btLabelNum
 
 # buildTypeXX_detail is derived, for any type number in buildTypeNums, from
 # the VolSize (not NewImageVolSize) of every non-dataDrive key in that type's
