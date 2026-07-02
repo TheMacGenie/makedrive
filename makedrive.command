@@ -347,71 +347,58 @@ add_copy_single_dmg () {
 
 		if rsync -Wh --progress "$imagePathToAdd" "$2"; then
 
-			# Determine icon source. Use $6 (external app path) when provided.
-			# Otherwise probe the DMG read-only for an embedded installer
-			# bundle (e.g. a pre-built installer volume like Mavericks, or a
-			# retail DVD). Modern installers are named "Install*.app"; classic
+			# Determine icon source. Use $6 (external app path) when provided,
+			# or an app just extracted from a pkg. Otherwise the image itself is
+			# searched for an embedded installer bundle while it is attached for
+			# icon work below (e.g. a pre-built installer volume like Mavericks,
+			# or a retail DVD). Modern installers are named "Install*.app"; classic
 			# retail DVDs (10.3 Panther / 10.4 Tiger) ship an extensionless
-			# "Install Mac OS X" bundle under "Welcome to Mac OS X". DVDs with
-			# no installer bundle fall through with no source and skip the icon
-			# step entirely.
+			# "Install Mac OS X" bundle under "Welcome to Mac OS X". DVDs with no
+			# installer bundle skip the icon step.
 			local iconSource="$6"
-			# If no app path was passed but we just extracted one from a pkg,
-			# use the extracted app as the icon source before probing the DMG.
 			[ -z "$iconSource" ] && [ -n "$_pkgExtractedApp" ] && iconSource="$_pkgExtractedApp"
-			local hasEmbeddedApp="N"
-			if [ -z "$iconSource" ]; then
-				local probeMount=""
-				probeMount=$(hdiutil attach "$2" -nobrowse -readonly -noverify 2>/dev/null \
-				    | awk -F'\t' 'NF>=3{mp=$NF} END{print mp}')
-				if [ -n "$probeMount" ]; then
-					find "$probeMount" -type d -maxdepth 2 \
-					    \( -name "Install Mac OS X" \
-					       -o -name "Install Mac OS X*.app" \
-					       -o -name "Install OS X*.app" \
-					       -o -name "Install macOS*.app" \) \
-					    -print -quit 2>/dev/null | grep -q . && hasEmbeddedApp="Y"
-					hdiutil detach -quiet "$probeMount" 2>/dev/null
+
+			# The image is never attached writable: a shadow file catches the icon
+			# writes (also the only attach mode DVD-style Apple_Driver_ATAPI images
+			# allow on Apple Silicon), and a single convert then merges base plus
+			# shadow into the UDRW image that is byte-patched below and compressed
+			# after. Compress and scan run exactly once, after any icon work is
+			# done.
+			local iconShadow="/var/tmp/makedrive-icon.shadow"
+			local iconMergedDmg="/var/tmp/makedrive-icon-merged.dmg"
+			local iconMount="" iconApplied="N"
+			rm -f "$iconShadow"
+			iconMount=$(hdiutil attach "$2" -shadow "$iconShadow" \
+			    -nobrowse -noverify 2>/dev/null \
+			    | awk -F'\t' 'NF>=3{mp=$NF} END{print mp}')
+			if [ -n "$iconMount" ]; then
+				local applySrc="$iconSource"
+				[ -z "$applySrc" ] && applySrc=$(find "$iconMount" -type d -maxdepth 2 \
+				    \( -name "Install Mac OS X" \
+				       -o -name "Install Mac OS X*.app" \
+				       -o -name "Install OS X*.app" \
+				       -o -name "Install macOS*.app" \) \
+				    -print -quit 2>/dev/null)
+				if [ -n "$applySrc" ]; then
+					dmg_apply_volume_icon "$applySrc" "$iconMount"
+					iconApplied="Y"
 				fi
+				hdiutil detach -quiet "$iconMount" 2>/dev/null
 			fi
 
-			# Apply icon if a source was found, converting to R/W first.
-			# Compress and scan run exactly once, after any icon work is done.
-			if [ -n "$iconSource" ] || [ "$hasEmbeddedApp" = "Y" ]; then
-				local iconRwDmg="/var/tmp/makedrive-icon-rw.dmg"
-				local iconShadow="/var/tmp/makedrive-icon.shadow"
-				local iconMergedDmg="/var/tmp/makedrive-icon-merged.dmg"
-				local iconMount=""
-				echo "Converting image for icon application..."
-				if hdiutil convert "$2" -format UDRW -o "$iconRwDmg"; then
-					# DVD-style images (Apple_Driver_ATAPI) refuse -readwrite on Apple
-					# Silicon. A shadow file provides a writable overlay without altering
-					# the base; we merge it back before handing off to dmgtool_compress.
-					rm -f "$iconShadow"
-					iconMount=$(hdiutil attach "$iconRwDmg" -shadow "$iconShadow" \
-					    -nobrowse -noverify 2>/dev/null \
-					    | awk -F'\t' 'NF>=3{mp=$NF} END{print mp}')
-					if [ -n "$iconMount" ]; then
-						local applySrc="$iconSource"
-						[ -z "$applySrc" ] && applySrc=$(find "$iconMount" -type d -maxdepth 2 \
-						    \( -name "Install Mac OS X" \
-						       -o -name "Install Mac OS X*.app" \
-						       -o -name "Install OS X*.app" \
-						       -o -name "Install macOS*.app" \) \
-						    -print -quit 2>/dev/null)
-						[ -n "$applySrc" ] && dmg_apply_volume_icon "$applySrc" "$iconMount"
-						hdiutil detach -quiet "$iconMount" 2>/dev/null
-					fi
-					echo "Merging icon changes..."
-					if hdiutil convert "$iconRwDmg" -shadow "$iconShadow" \
-					    -format UDRW -o "$iconMergedDmg" 2>/dev/null; then
-						# Zero finderInfo[0..5] in the merged image. Running post-merge
-						# ensures the shadow write-back (macOS updates the volume header
-						# on mount/unmount) cannot override the patch. finderInfo[6,7]
-						# (UUID) are preserved. finderInfo[1]=0 means no open-folder CNID
-						# so Finder does not auto-open on a fresh hardware connect.
-						# 10.7+ images use GUID and have no APM DDM; they exit early.
-						python3 -c "
+			# Merge only when an icon was actually written; if the merge fails the
+			# original image is left untouched and simply goes uniconed.
+			if [ "$iconApplied" = "Y" ]; then
+				echo "Merging icon changes..."
+				if hdiutil convert "$2" -shadow "$iconShadow" \
+				    -format UDRW -o "$iconMergedDmg" 2>/dev/null; then
+					# Zero finderInfo[0..5] in the merged image. Running post-merge
+					# ensures the shadow write-back (macOS updates the volume header
+					# on mount/unmount) cannot override the patch. finderInfo[6,7]
+					# (UUID) are preserved. finderInfo[1]=0 means no open-folder CNID
+					# so Finder does not auto-open on a fresh hardware connect.
+					# 10.7+ images use GUID and have no APM DDM; they exit early.
+					python3 -c "
 import sys, struct
 with open(sys.argv[1], 'r+b') as f:
     ddm = f.read(4)
@@ -443,15 +430,11 @@ with open(sys.argv[1], 'r+b') as f:
                 f.seek(base + idx * 4)
                 f.write(b'\\x00\\x00\\x00\\x00')
 " "$iconMergedDmg" 2>/dev/null
-						rm -f "$2"
-						mv "$iconMergedDmg" "$2"
-					else
-						rm -f "$2"
-						mv "$iconRwDmg" "$2"
-					fi
+					rm -f "$2"
+					mv "$iconMergedDmg" "$2"
 				fi
-				rm -f "$iconRwDmg" "$iconShadow" "$iconMergedDmg"
 			fi
+			rm -f "$iconShadow" "$iconMergedDmg"
 
 			dmgtool_compress_dmg "$2"
 			dmgtool_scan_dmg "$2"
@@ -1460,37 +1443,42 @@ download_fetch_and_process () {
 
 
 # ------------------------------------------------------------------------------
-# download_installer_menu
-# Presents a list of macOS installers available for direct download from Apple.
-# Versions 10.13 and newer come from Apple's software-update catalog (fetched
-# on demand). Versions 10.7-10.12 (except 10.9, which has no Apple-hosted
-# source) come from hardcoded Apple CDN URLs. After the user selects a version
-# the download and processing are handled by download_fetch_and_process.
+# catalog_fetch_vars
+# Fetches Apple's software-update catalogs and prints shell-sourceable
+# variable assignments describing the newest installer per macOS generation.
+# Shared by startup_sync_versions and download_installer_menu, which need the
+# same catalog walk but different outputs:
+#
+#   sync - MACOS_DL_* version/build pairs only (lightweight startup check)
+#   menu - MAKEDRIVE_DLCAT_* rows with download URLs and sizes
+#
+# Callers redirect stdout to a temp file, verify the COUNT marker is present
+# (network failure produces no output), and source it.
+#
+# $1 - Output mode: "sync" or "menu"
 # ------------------------------------------------------------------------------
-download_installer_menu () {
+catalog_fetch_vars () {
 
-	disp_print_header
-	echo "Fetching available installer list from Apple..."
-	echo ""
-
-	local syncFile
-	syncFile=$(mktemp -t makedrive-dlcatalog) || {
-		echo "Could not create temp file."
-		echo ""
-		disp_pause_for_input
-		return 1
-	}
-
-	# Extended catalog fetch: mirrors startup_sync_versions but also captures
-	# download URLs and sizes for the latest installer per major version.
 	local _catURLs _menuOrder
 	printf -v _catURLs '%s\n' "${catalogURLs[@]}"
 	printf -v _menuOrder '%s\n' "${addMenuOrder[@]}"
-	MAKEDRIVE_CATALOG_URLS="$_catURLs" MAKEDRIVE_MENU_ORDER="$_menuOrder" \
-	python3 << 'MAKEDRIVE_DLCAT_PYEOF' > "$syncFile" 2>/dev/null
+
+	MAKEDRIVE_CATALOG_MODE="$1" \
+	MAKEDRIVE_CATALOG_URLS="$_catURLs" \
+	MAKEDRIVE_MENU_ORDER="$_menuOrder" \
+	python3 << 'MAKEDRIVE_CATALOG_PYEOF'
 import subprocess, gzip, plistlib, sys, re, os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Shared catalog walker for startup_sync_versions and download_installer_menu.
+# MAKEDRIVE_CATALOG_MODE selects the output, both shell-sourceable variable
+# assignments printed to stdout:
+#   sync - MACOS_DL_* version/build pairs per macOS generation
+#   menu - MAKEDRIVE_DLCAT_* download rows (key, build, source type, URLs, size)
+MODE = os.environ.get("MAKEDRIVE_CATALOG_MODE", "sync")
+
+# Fetch a URL with curl (follows redirects, fails on HTTP errors). Returns the
+# raw response bytes, or None on any network/process failure.
 def fetch(url, timeout=30):
     try:
         r = subprocess.run(
@@ -1501,9 +1489,15 @@ def fetch(url, timeout=30):
     except Exception:
         return None
 
+# Catalog index URLs come from makedrive.conf (catalogURLs), passed in via the
+# MAKEDRIVE_CATALOG_URLS environment variable, one URL per line. MENU_ORDER
+# carries addMenuOrder the same way for mapping versions to conf keys (menu
+# mode only).
 CATALOG_URLS = [u for u in os.environ.get("MAKEDRIVE_CATALOG_URLS", "").splitlines() if u]
 MENU_ORDER   = [k for k in os.environ.get("MAKEDRIVE_MENU_ORDER",   "").splitlines() if k]
 
+# Merge the Products dict from every catalog (gzip-compressed plist). On a key
+# collision the earlier catalog wins, so list the freshest catalog first.
 products = {}
 for url in CATALOG_URLS:
     data = fetch(url, timeout=60)
@@ -1522,6 +1516,9 @@ for url in CATALOG_URLS:
 if not products:
     sys.exit(0)
 
+# A product is a full macOS installer iff its ExtendedMetaInfo carries
+# InstallAssistantPackageIdentifiers. Each one's English distribution URL - a
+# small XML file - holds the human-readable version and build strings.
 installer_products = {
     pid: prod for pid, prod in products.items()
     if "InstallAssistantPackageIdentifiers" in prod.get("ExtendedMetaInfo", {})
@@ -1560,30 +1557,54 @@ def parse_build(b):
     major, letter, point, suffix = m.groups()
     return (int(major), letter, int(point), suffix)
 
-raw_results = []
+# Distribution files are fetched concurrently. Keep only the newest version
+# and build for each macOS generation (keyed by major, or "10.x" for the 10
+# line). Versions before 10.13 and the nonexistent 16-25 range (Apple jumped
+# 15 → 26) are dropped as catalog noise; 10.7-10.12 downloads come from
+# hardcoded Apple CDN URLs in download_installer_menu instead. Multiple
+# products can share the same VERSION string across supplemental updates
+# (e.g. 19H2/19H4/19H15 all "10.15.7"), so build must be compared too;
+# otherwise whichever entry is processed first wins regardless of how
+# outdated it actually is.
+newest = {}
 with ThreadPoolExecutor(max_workers=15) as ex:
     for fut in as_completed([ex.submit(get_version_build, item)
                              for item in installer_products.items()]):
         r = fut.result()
-        if r:
-            raw_results.append(r)
+        if not r:
+            continue
+        pid, version, build, packages, dist_url = r
+        p = parse_ver(version)
+        if (p[0] == 10 and (len(p) < 2 or p[1] < 13)) or 16 <= p[0] <= 25:
+            continue
+        bucket = "10." + str(p[1]) if p[0] == 10 and len(p) > 1 else str(p[0])
+        sortKey = (p, parse_build(build))
+        if bucket not in newest or sortKey > newest[bucket]["_sortKey"]:
+            newest[bucket] = {"version": version, "build": build,
+                              "packages": packages, "dist_url": dist_url,
+                              "_sortKey": sortKey}
 
-# Keep latest per major version; skip pre-10.13 and 16-25.
-# 10.13-10.15 use catalog_hfs (installer → temp HFS+ volume).
-# 10.7-10.12 are handled separately via hardcoded Apple CDN URLs below.
-# Multiple catalog products can share the same VERSION string (e.g. three
-# different builds - 19H2, 19H4, 19H15 - all reporting "10.15.7" for
-# supplemental updates), so build must be compared too; otherwise whichever
-# entry is processed first wins regardless of how outdated it actually is.
-newest = {}
-for pid, version, build, packages, dist_url in raw_results:
-    p = parse_ver(version)
-    if (p[0] == 10 and (len(p) < 2 or p[1] < 13)) or 16 <= p[0] <= 25:
-        continue
-    bucket = "10." + str(p[1]) if p[0] == 10 and len(p) > 1 else str(p[0])
-    sortKey = (p, parse_build(build))
-    if bucket not in newest or sortKey > newest[bucket]["_sortKey"]:
-        newest[bucket] = {"version": version, "build": build, "packages": packages, "dist_url": dist_url, "_sortKey": sortKey}
+# Emit newest generation first. The output file is sourced by a root shell
+# and the version, build, and URL strings came from remote catalog data, so
+# anything that doesn't match the only shape it can legitimately have is
+# dropped - a value these patterns reject could otherwise break out of its
+# double quotes when sourced.
+SAFE_VERSION = re.compile(r'^[0-9]+(\.[0-9]+)*$')
+SAFE_BUILD   = re.compile(r'^[0-9A-Za-z.]*$')
+SAFE_URL     = re.compile(r'^https://[A-Za-z0-9._~:/%+=-]+$')
+
+final = sorted(newest.values(), key=lambda e: parse_ver(e["version"]), reverse=True)
+
+if MODE == "sync":
+    final = [e for e in final
+             if SAFE_VERSION.match(e["version"]) and SAFE_BUILD.match(e["build"])]
+    print("MACOS_DL_COUNT=" + str(len(final)))
+    for i, e in enumerate(final):
+        print('MACOS_DL_VERSION_' + str(i) + '="' + e["version"] + '"')
+        print('MACOS_DL_BUILD_'   + str(i) + '="' + e["build"] + '"')
+    sys.exit(0)
+
+# menu mode from here down: build MAKEDRIVE_DLCAT_* download rows.
 
 SKIP = {"InstallAssistantAuto.pkg", "MajorOSInfo.pkg", "InstallInfo.plist",
         "UpdateBrain.zip", "com_apple_MobileAsset_MacSoftwareUpdate.plist"}
@@ -1600,6 +1621,13 @@ def real_packages(packages):
             result.append((url, size))
     return result
 
+# The files download_fetch_and_process's catalog_hfs case actually downloads;
+# must match the filename filter there. Used only to size the menu entry so
+# it reflects what will really transfer.
+HFS_DOWNLOADED = {"InstallAssistantAuto.pkg", "InstallESDDmg.pkg",
+                  "BaseSystem.dmg", "AppleDiagnostics.dmg",
+                  "BaseSystem.chunklist", "AppleDiagnostics.chunklist"}
+
 def conf_key_for(version):
     p = parse_ver(version)
     major = p[0]
@@ -1610,7 +1638,6 @@ def conf_key_for(version):
             return k
     return None
 
-final = sorted(newest.values(), key=lambda e: parse_ver(e["version"]), reverse=True)
 rows = []
 for entry in final:
     version = entry["version"]
@@ -1627,28 +1654,23 @@ for entry in final:
             continue
         rows.append((key, entry["build"], "catalog_single", url, size))
     elif p[0] == 10 and p[1] >= 13:
-        # 10.13-10.15: download distribution file + all packages into one directory,
-        # then `installer -pkg dist -target <hfs_volume>` assembles the .app without
-        # needing write access to the sealed system volume (which blocks -target / on 11+).
-        # Chunklist URLs are kept here (not filtered) - BaseSystem.chunklist is required
-        # for 10.15 to boot; download_fetch_and_process's catalog_hfs case is the actual
-        # filter deciding which specific files get downloaded and used.
+        # 10.13-10.15: pass the distribution URL plus every package URL;
+        # download_fetch_and_process's catalog_hfs case is the actual filter
+        # deciding which specific files get downloaded and assembled with
+        # pkgutil. Chunklist URLs are kept here (not filtered) because
+        # BaseSystem.chunklist is required for 10.15 to boot. The size counts
+        # only the files that case will actually download.
         all_pkg_urls = [pkg.get("URL", "") for pkg in entry["packages"] if pkg.get("URL", "")]
         dist_url = entry["dist_url"]
-        total_size = sum(pkg.get("Size", 0) for pkg in entry["packages"] if pkg.get("URL", ""))
+        total_size = sum(pkg.get("Size", 0) for pkg in entry["packages"]
+                         if pkg.get("URL", "").split("/")[-1] in HFS_DOWNLOADED)
         combined = "|".join([dist_url] + all_pkg_urls)
         rows.append((key, entry["build"], "catalog_hfs", combined, total_size))
 
-# The emitted file is sourced by a root shell, and the build and URL strings
-# come from remote catalog data. Drop any row whose fields don't match the
-# only shape they can legitimately have - a value these patterns reject could
-# otherwise break out of its double quotes when sourced. dtype is
-# script-internal and key comes from the local conf, but checking them too
-# costs nothing.
-SAFE_KEY   = re.compile(r'^inst[A-Za-z0-9]+$')
-SAFE_TYPE  = re.compile(r'^[a-z_]+$')
-SAFE_BUILD = re.compile(r'^[0-9A-Za-z.]*$')
-SAFE_URL   = re.compile(r'^https://[A-Za-z0-9._~:/%+=-]+$')
+# Same sourced-by-root reasoning as above. dtype is script-internal and key
+# comes from the local conf, but checking them too costs nothing.
+SAFE_KEY  = re.compile(r'^inst[A-Za-z0-9]+$')
+SAFE_TYPE = re.compile(r'^[a-z_]+$')
 
 def row_is_safe(key, build, dtype, url, size):
     # url is a single URL, or pipe-separated URLs for catalog_hfs
@@ -1664,7 +1686,36 @@ for i, (key, build, dtype, url, size) in enumerate(rows):
     print(f'MAKEDRIVE_DLCAT_{i}_TYPE="{dtype}"')
     print(f'MAKEDRIVE_DLCAT_{i}_URL="{url}"')
     print(f'MAKEDRIVE_DLCAT_{i}_BYTES={size}')
-MAKEDRIVE_DLCAT_PYEOF
+MAKEDRIVE_CATALOG_PYEOF
+
+}
+
+
+# ------------------------------------------------------------------------------
+# download_installer_menu
+# Presents a list of macOS installers available for direct download from Apple.
+# Versions 10.13 and newer come from Apple's software-update catalog (fetched
+# on demand). Versions 10.7-10.12 (except 10.9, which has no Apple-hosted
+# source) come from hardcoded Apple CDN URLs. After the user selects a version
+# the download and processing are handled by download_fetch_and_process.
+# ------------------------------------------------------------------------------
+download_installer_menu () {
+
+	disp_print_header
+	echo "Fetching available installer list from Apple..."
+	echo ""
+
+	local syncFile
+	syncFile=$(mktemp -t makedrive-dlcatalog) || {
+		echo "Could not create temp file."
+		echo ""
+		disp_pause_for_input
+		return 1
+	}
+
+	# Same catalog walk as startup_sync_versions; menu mode also captures
+	# download URLs and sizes for the latest installer per major version.
+	catalog_fetch_vars menu > "$syncFile" 2>/dev/null
 
 	if ! grep -q "^MAKEDRIVE_DLCAT_COUNT=" "$syncFile" 2>/dev/null; then
 		rm -f "$syncFile"
@@ -2020,118 +2071,7 @@ startup_sync_versions () {
 
 	printf "Verifying latest macOS installer versions with Apple..."
 
-	local _catURLs
-	printf -v _catURLs '%s\n' "${catalogURLs[@]}"
-	MAKEDRIVE_CATALOG_URLS="$_catURLs" python3 << 'MAKEDRIVE_SYNC_PYEOF' > "$syncVarsFile" 2>/dev/null
-import subprocess, gzip, plistlib, sys, re, os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# Fetch a URL with curl (follows redirects, fails on HTTP errors). Returns the
-# raw response bytes, or None on any network/process failure.
-def fetch(url, timeout=30):
-    try:
-        r = subprocess.run(
-            ["curl", "--silent", "--fail", "--location",
-             "--max-time", str(timeout), "--user-agent", "makedrive", url],
-            capture_output=True, timeout=timeout + 10)
-        return r.stdout if r.returncode == 0 else None
-    except Exception:
-        return None
-
-# Catalog index URLs come from makedrive.conf (catalogURLs), passed in via the
-# MAKEDRIVE_CATALOG_URLS environment variable, one URL per line.
-CATALOG_URLS = [u for u in os.environ.get("MAKEDRIVE_CATALOG_URLS", "").splitlines() if u]
-
-# Merge the Products dict from every catalog (gzip-compressed plist). On a key
-# collision the earlier catalog wins, so list the freshest catalog first.
-products = {}
-for url in CATALOG_URLS:
-    data = fetch(url, timeout=60)
-    if not data:
-        continue
-    try:
-        raw = gzip.decompress(data)
-    except Exception:
-        raw = data
-    try:
-        for pid, prod in plistlib.loads(raw).get("Products", {}).items():
-            products.setdefault(pid, prod)
-    except Exception:
-        pass
-
-if not products:
-    sys.exit(0)
-
-# A product is a full macOS installer iff its ExtendedMetaInfo carries
-# InstallAssistantPackageIdentifiers. Collect each one's English distribution
-# URL - that small XML file holds the human-readable version and build strings.
-dist_urls = [
-    prod["Distributions"]["English"]
-    for prod in products.values()
-    if "InstallAssistantPackageIdentifiers" in prod.get("ExtendedMetaInfo", {})
-    and prod.get("Distributions", {}).get("English")
-]
-
-def get_version_build(dist_url):
-    data = fetch(dist_url, timeout=15)
-    if not data:
-        return None, ""
-    text = data.decode("utf-8", errors="ignore")
-    vm = re.search(r"<key>VERSION</key>\s*<string>([^<]+)</string>", text)
-    bm = re.search(r"<key>BUILD</key>\s*<string>([^<]+)</string>", text)
-    return (vm.group(1).strip() if vm else None), (bm.group(1).strip() if bm else "")
-
-def parse_ver(v):
-    try:
-        return tuple(int(x) for x in str(v).strip().split("."))
-    except Exception:
-        return (0,)
-
-def parse_build(b):
-    # See matching comment in download_installer_menu's copy of this
-    # function - plain string comparison of build numbers is wrong
-    # ("19H15" < "19H4" lexically), so parse into a tuple instead.
-    m = re.match(r'^(\d+)([A-Za-z]+)(\d+)([a-zA-Z]*)$', str(b).strip())
-    if not m:
-        return (0, '', 0, '')
-    major, letter, point, suffix = m.groups()
-    return (int(major), letter, int(point), suffix)
-
-# Distribution files are fetched concurrently. Keep only the newest version and
-# build for each macOS generation (keyed by major, or "10.x" for the 10 line).
-# Versions before 10.13 and the nonexistent 16-25 range (Apple jumped 15 → 26)
-# are dropped as catalog noise. Multiple products can share the same VERSION
-# string across supplemental updates (e.g. 19H2/19H4/19H15 all "10.15.7"), so
-# build must be compared too - see matching comment in download_installer_menu.
-newest = {}
-with ThreadPoolExecutor(max_workers=15) as ex:
-    for fut in as_completed([ex.submit(get_version_build, u) for u in dist_urls]):
-        version, build = fut.result()
-        if not version:
-            continue
-        p = parse_ver(version)
-        if (p[0] == 10 and (len(p) < 2 or p[1] < 13)) or 16 <= p[0] <= 25:
-            continue
-        key = "10." + str(p[1]) if p[0] == 10 and len(p) > 1 else str(p[0])
-        sortKey = (p, parse_build(build))
-        if key not in newest or sortKey > newest[key]["_sortKey"]:
-            newest[key] = {"version": version, "build": build, "_sortKey": sortKey}
-
-# Emit newest generation first as shell-sourceable assignments. The output
-# file is sourced by a root shell and the version and build strings came from
-# remote catalog XML, so drop any entry whose values don't match the only
-# shape they can legitimately have - a value these patterns reject could
-# otherwise break out of its double quotes when sourced.
-SAFE_VERSION = re.compile(r'^[0-9]+(\.[0-9]+)*$')
-SAFE_BUILD   = re.compile(r'^[0-9A-Za-z.]*$')
-final = sorted(newest.values(), key=lambda e: parse_ver(e["version"]), reverse=True)
-final = [e for e in final
-         if SAFE_VERSION.match(e["version"]) and SAFE_BUILD.match(e["build"])]
-print("MACOS_DL_COUNT=" + str(len(final)))
-for i, e in enumerate(final):
-    print('MACOS_DL_VERSION_' + str(i) + '="' + e["version"] + '"')
-    print('MACOS_DL_BUILD_'   + str(i) + '="' + e["build"] + '"')
-MAKEDRIVE_SYNC_PYEOF
+	catalog_fetch_vars sync > "$syncVarsFile" 2>/dev/null
 
 	echo " done."
 
@@ -3541,7 +3481,8 @@ postflight_cleanup () {
 
 	rm -f "$makedriveLockFile"
 	rm -f "$makedriveInstTmpImageFile"
-	
+	rm -f "/var/tmp/makedrive-icon.shadow" "/var/tmp/makedrive-icon-merged.dmg"
+
 	if [ -d "$executionPath/restorekit" ]; then
 		chmod -RN "$executionPath/restorekit"
 		[ -n "$SUDO_USER" ] && chown -Rf "$SUDO_USER" "$executionPath/restorekit"
