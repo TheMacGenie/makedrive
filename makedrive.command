@@ -437,7 +437,7 @@ with open(sys.argv[1], 'r+b') as f:
             hfs_off = 0
     if hfs_off is not None:
         base = hfs_off + 1024 + 80
-        for idx in range(8):
+        for idx in range(6):
             f.seek(base + idx * 4)
             if struct.unpack('>I', f.read(4))[0]:
                 f.seek(base + idx * 4)
@@ -1611,7 +1611,6 @@ def conf_key_for(version):
     return None
 
 final = sorted(newest.values(), key=lambda e: parse_ver(e["version"]), reverse=True)
-count = 0
 rows = []
 for entry in final:
     version = entry["version"]
@@ -1640,6 +1639,24 @@ for entry in final:
         combined = "|".join([dist_url] + all_pkg_urls)
         rows.append((key, entry["build"], "catalog_hfs", combined, total_size))
 
+# The emitted file is sourced by a root shell, and the build and URL strings
+# come from remote catalog data. Drop any row whose fields don't match the
+# only shape they can legitimately have - a value these patterns reject could
+# otherwise break out of its double quotes when sourced. dtype is
+# script-internal and key comes from the local conf, but checking them too
+# costs nothing.
+SAFE_KEY   = re.compile(r'^inst[A-Za-z0-9]+$')
+SAFE_TYPE  = re.compile(r'^[a-z_]+$')
+SAFE_BUILD = re.compile(r'^[0-9A-Za-z.]*$')
+SAFE_URL   = re.compile(r'^https://[A-Za-z0-9._~:/%+=-]+$')
+
+def row_is_safe(key, build, dtype, url, size):
+    # url is a single URL, or pipe-separated URLs for catalog_hfs
+    return bool(SAFE_KEY.match(key) and SAFE_BUILD.match(build)
+                and SAFE_TYPE.match(dtype) and str(size).isdigit()
+                and all(SAFE_URL.match(u) for u in url.split("|")))
+
+rows = [r for r in rows if row_is_safe(*r)]
 print(f"MAKEDRIVE_DLCAT_COUNT={len(rows)}")
 for i, (key, build, dtype, url, size) in enumerate(rows):
     print(f'MAKEDRIVE_DLCAT_{i}_KEY="{key}"')
@@ -2100,8 +2117,16 @@ with ThreadPoolExecutor(max_workers=15) as ex:
         if key not in newest or sortKey > newest[key]["_sortKey"]:
             newest[key] = {"version": version, "build": build, "_sortKey": sortKey}
 
-# Emit newest generation first as shell-sourceable assignments.
+# Emit newest generation first as shell-sourceable assignments. The output
+# file is sourced by a root shell and the version and build strings came from
+# remote catalog XML, so drop any entry whose values don't match the only
+# shape they can legitimately have - a value these patterns reject could
+# otherwise break out of its double quotes when sourced.
+SAFE_VERSION = re.compile(r'^[0-9]+(\.[0-9]+)*$')
+SAFE_BUILD   = re.compile(r'^[0-9A-Za-z.]*$')
 final = sorted(newest.values(), key=lambda e: parse_ver(e["version"]), reverse=True)
+final = [e for e in final
+         if SAFE_VERSION.match(e["version"]) and SAFE_BUILD.match(e["build"])]
 print("MACOS_DL_COUNT=" + str(len(final)))
 for i, e in enumerate(final):
     print('MACOS_DL_VERSION_' + str(i) + '="' + e["version"] + '"')
@@ -3667,7 +3692,12 @@ preflight_check_root () {
 		echo ""
 		echo "makedrive must be run as root for proper operation."
 		echo ""
-		sudo -p "Enter your admin password and hit return to continue: " "$executionPath/$(basename "$0")" && exit
+		# Re-run the script as root, then always exit with the child's status.
+		# The exit must be unconditional: with "sudo ... && exit", a failed
+		# password or any nonzero exit from the elevated child would drop
+		# execution through into the rest of the script unprivileged.
+		sudo -p "Enter your admin password and hit return to continue: " "$executionPath/$(basename "$0")"
+		exit $?
 	fi
 		
 }
